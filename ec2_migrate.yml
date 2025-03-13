@@ -1,0 +1,148 @@
+---
+# This playbook automates the migration of an EC2 instance to GCP
+
+- name: Migrate AWS EC2 instance to Google Cloud Platform
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # AWS configurations
+    aws_region: "us-west-2"
+    ec2_instance_id: "i-0123456789abcdef0"
+    aws_profile: "default"
+    
+    # GCP configurations
+    gcp_project: "my-gcp-project"
+    gcp_zone: "us-west1-a"
+    gcp_bucket: "migration-bucket"
+    gcp_service_account_file: "{{ lookup('env', 'HOME') }}/.gcp/service-account.json"
+    
+    # Migration configurations
+    local_temp_dir: "/tmp/ec2-to-gcp"
+    instance_name: "migrated-instance"
+    machine_type: "n2-standard-2"
+    network: "default"
+    
+  tasks:
+    - name: Install the required Python packages
+      ansible.builtin.pip:
+        name:
+          - awscli
+          - google-api-python-client
+          - google-auth-httplib2
+          - google-auth-oauthlib
+        executable: pip3
+        state: present
+      
+    - name: Ensure temporary directory exists
+      ansible.builtin.file:
+        path: "{{ local_temp_dir }}"
+        state: directory
+        mode: '0755'
+    
+    - name: Create snapshot of EC2 instance
+      amazon.aws.ec2_snapshot:
+        region: "{{ aws_region }}"
+        instance_id: "{{ ec2_instance_id }}"
+        description: "Snapshot for migration to GCP"
+        profile: "{{ aws_profile }}"
+      register: snapshot_result
+    
+    - name: Create AMI from snapshot
+      amazon.aws.ec2_ami:
+        region: "{{ aws_region }}"
+        name: "migration-ami-{{ ec2_instance_id }}"
+        description: "AMI for migration to GCP"
+        snapshot_id: "{{ snapshot_result.snapshot_id }}"
+        wait: yes
+        profile: "{{ aws_profile }}"
+      register: ami_result
+    
+    - name: Export AMI to S3
+      amazon.aws.ec2_export:
+        region: "{{ aws_region }}"
+        image_id: "{{ ami_result.image_id }}"
+        s3_bucket: "ec2-migration-{{ ec2_instance_id }}"
+        s3_key: "exported-ami.vmdk"
+        disk_image_format: "vmdk"
+        profile: "{{ aws_profile }}"
+      register: export_result
+      
+    - name: Wait for export task to complete
+      amazon.aws.ec2_export_info:
+        region: "{{ aws_region }}"
+        export_task_id: "{{ export_result.export_task_id }}"
+        profile: "{{ aws_profile }}"
+      register: export_status
+      until: export_status.export_tasks[0].state == "completed"
+      retries: 60
+      delay: 60
+      
+    - name: Download exported image
+      amazon.aws.s3_object:
+        bucket: "ec2-migration-{{ ec2_instance_id }}"
+        object: "exported-ami.vmdk"
+        dest: "{{ local_temp_dir }}/exported-ami.vmdk"
+        mode: get
+        profile: "{{ aws_profile }}"
+      
+    - name: Authenticate to GCP
+      community.google.gcp_auth:
+        service_account_file: "{{ gcp_service_account_file }}"
+        project: "{{ gcp_project }}"
+        
+    - name: Create GCP storage bucket if not exists
+      google.cloud.gcp_storage_bucket:
+        name: "{{ gcp_bucket }}"
+        project: "{{ gcp_project }}"
+        auth_kind: serviceaccount
+        service_account_file: "{{ gcp_service_account_file }}"
+        state: present
+        
+    - name: Upload image to GCP storage
+      google.cloud.gcp_storage_object:
+        bucket: "{{ gcp_bucket }}"
+        name: "exported-ami.vmdk"
+        src: "{{ local_temp_dir }}/exported-ami.vmdk"
+        project: "{{ gcp_project }}"
+        auth_kind: serviceaccount
+        service_account_file: "{{ gcp_service_account_file }}"
+        state: present
+      
+    - name: Import image to GCP
+      shell: |
+        gcloud compute images import {{ instance_name }}-image \
+          --source-file=gs://{{ gcp_bucket }}/exported-ami.vmdk \
+          --os=debian-9 \
+          --project={{ gcp_project }}
+      environment:
+        GOOGLE_APPLICATION_CREDENTIALS: "{{ gcp_service_account_file }}"
+      
+    - name: Create instance in GCP
+      google.cloud.gcp_compute_instance:
+        name: "{{ instance_name }}"
+        machine_type: "{{ machine_type }}"
+        disks:
+          - auto_delete: true
+            boot: true
+            source:
+              name: "{{ instance_name }}-image"
+              type: image
+        network_interfaces:
+          - network: "{{ network }}"
+            access_configs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+        zone: "{{ gcp_zone }}"
+        project: "{{ gcp_project }}"
+        auth_kind: serviceaccount
+        service_account_file: "{{ gcp_service_account_file }}"
+        state: present
+      
+    - name: Clean up temporary files
+      file:
+        path: "{{ local_temp_dir }}"
+        state: absent
+        
+    - name: Output GCP instance details
+      debug:
+        msg: "Instance successfully migrated to GCP. Instance name: {{ instance_name }} in zone {{ gcp_zone }}."
